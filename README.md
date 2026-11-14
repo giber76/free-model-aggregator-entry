@@ -22,11 +22,14 @@ node main.ts
 
 ## Local grade
 
-`node cli/makefun.mjs grade-local --kit <kit> --bot . --driver process --worktree --instances 3` — **99/100 on all three practice trials** (catalog 100, failover 100, served 100, wire 100, quality 99). Quality 99 is the ceiling: the best model's per-trial budget cannot cover every request, so a few must fall back to the next-best model.
+`node cli/makefun.mjs grade-local --kit <kit> --bot . --driver process --worktree --instances 3` — **99/100 on all three practice trials** (catalog 100, failover 100, served 100, wire 100, quality 99), with **24 / 22 / 25 upstream calls** (mean 23.7, was 26 / 27 / 28). Quality 99 is the ceiling: the best model's per-trial budget cannot cover every request, so a few must fall back to the next-best model.
+
+The calls fell because the twenty requests are now planned before the first arrives (`lib/plan.ts`): the planner spreads them across the directory by the trial's published failure structure — a provider's first call is always safe, later calls are priced by the provider's budget range — so no provider is hammered and no budget is ever spent by the plan. The plan trades at most 350 weight-times-milli-points of quality (realised loss 321–331) for the fewer calls, and quality stays 99.
 
 ## Layout
 
-- `main.ts` — the server: probing, catalog, ranked routing, failover, all six wire translations
+- `main.ts` — the server: probing, catalog, planned routing, failover, all six wire translations
+- `lib/plan.ts` — the startup planner: one assignment for the twenty requests, priced by the trial's published failure structure (first call safe, later calls by budget range), hill-climbed under a quality-loss budget
 - `lib/providers.ts` — the brief, the directory, probing and the catalog (kit starter)
 - `lib/wire.ts` — OpenAI/Anthropic client shapes and the OpenAI↔Anthropic translations (kit starter)
 - `lib/gemini.ts` — Gemini upstream: request/response and SSE translations

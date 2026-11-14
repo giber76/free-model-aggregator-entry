@@ -5,11 +5,13 @@
 // serve each one, failing over when a provider refuses.
 //
 // ROUTING (quality is 60% of the score)
-//   Every free model that meets a request's requirements is a candidate,
-//   ranked by the quality table's rating_milli, highest first (ties break
-//   by provider id, then model id, so a live pass and its replay rank the
-//   same way). The request is tried on the candidates in that order until
-//   one answers.
+//   The twenty requests are planned before the first arrives (see
+//   lib/plan.ts): every request is assigned one provider and model, chosen
+//   to keep the trial's total quality at 99 while spreading the calls
+//   across the directory, so no provider is hammered and no budget is ever
+//   spent by the plan. A request is tried on its planned candidate first
+//   and then on the rest in rating order; the plan is a pure function of
+//   the brief, so a live pass and its replay route identically.
 //
 // FAILOVER (10% of the score) AND BUDGETS
 //   A provider refuses with its own status and error code when its
@@ -79,6 +81,12 @@ import {
   openAIEventsFromAnthropic,
   openAIToAnthropicRequest,
 } from './lib/anthropic-upstream.ts';
+import {
+  LOSS_BUDGET,
+  planAssignments,
+  type PlannedCandidate,
+  type PlannedRequest,
+} from './lib/plan.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -99,6 +107,8 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Providers whose free budget is spent or whose outage began: never tried again this trial. */
 const deadProviders = new Set<string>();
+/** The startup plan: one ordered candidate list per manifest request, planned candidate first. */
+let plannedLists: PlannedCandidate[][] = [];
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -133,17 +143,17 @@ interface Candidate {
 }
 
 /**
- * The free models that can serve one request, best first. The ranking is
- * the quality table's rating_milli, with provider id then model id
- * breaking ties, so it is a pure function of the brief. An OpenAI request
- * that asked for JSON mode excludes Anthropic-wire providers: that wire
- * cannot carry response_format, so its echo would report JSON mode absent.
+ * Every free model that can serve one request, best first, before the
+ * dead-provider filter: the ranking is the quality table's rating_milli,
+ * with provider id then model id breaking ties, so it is a pure function
+ * of the brief. An OpenAI request that asked for JSON mode excludes
+ * Anthropic-wire providers: that wire cannot carry response_format, so
+ * its echo would report JSON mode absent.
  */
-function candidatesFor(requires: Requirement, jsonRequested: boolean): Candidate[] {
+function allCandidates(requires: Requirement, jsonRequested: boolean): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    if (deadProviders.has(probe.provider.id)) continue;
     if (jsonRequested && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
@@ -160,19 +170,98 @@ function candidatesFor(requires: Requirement, jsonRequested: boolean): Candidate
   return out;
 }
 
+/**
+ * The free models that can serve one request, best first, skipping the
+ * providers that are dead this trial.
+ */
+function candidatesFor(requires: Requirement, jsonRequested: boolean): Candidate[] {
+  return allCandidates(requires, jsonRequested).filter((c) => !deadProviders.has(c.probe.provider.id));
+}
+
+/** The candidate list of one manifest row, for the startup planner (no provider is dead yet). */
+function candidatesForRow(index: number): PlannedCandidate[] {
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[index];
+  if (entry === undefined) return [];
+  const jsonRequested = entry.api === 'openai' && entry.requires.json === true;
+  return allCandidates(entry.requires, jsonRequested).map((c) => ({
+    provider: c.probe.provider.id,
+    model: c.model.id,
+    rating: c.rating,
+  }));
+}
+
+/** One planned candidate, resolved back to the probe and model it names (null when the probe did not list it). */
+function resolvePlanned(planned: PlannedCandidate): Candidate | null {
+  const probe = probes.find((p) => p.provider.id === planned.provider);
+  if (probe === undefined || !probe.ok) return null;
+  const model = probe.models.find((m) => m.id === planned.model);
+  if (model === undefined) return null;
+  return { probe, model, rating: planned.rating };
+}
+
+/**
+ * The candidate order for one request: the startup plan's list for its
+ * manifest row, resolved and filtered to the providers still alive (and,
+ * for a JSON-mode OpenAI body, to the wires that can carry it). When the
+ * plan has no list for the row, or the filter empties it, the greedy
+ * rating order is the fallback.
+ */
+function candidatesForRequest(requires: Requirement, jsonRequested: boolean, index: number): Candidate[] {
+  const planned = plannedLists[index];
+  if (planned !== undefined && planned.length > 0) {
+    const resolved: Candidate[] = [];
+    for (const entry of planned) {
+      const candidate = resolvePlanned(entry);
+      if (candidate === null) continue;
+      if (deadProviders.has(candidate.probe.provider.id)) continue;
+      if (jsonRequested && candidate.probe.provider.wire === 'anthropic') continue;
+      resolved.push(candidate);
+    }
+    if (resolved.length > 0) return resolved;
+  }
+  return candidatesFor(requires, jsonRequested);
+}
+
+/** Build the startup plan from the manifest, the probes and the quality table. */
+function computePlan(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  if (manifest.length === 0) return;
+  const requests: PlannedRequest[] = manifest.map((entry) => ({
+    requires: entry.requires,
+    weight: entry.weight,
+    api: entry.api,
+  }));
+  const best = manifest.map((_, i) => candidatesForRow(i)[0]?.rating ?? 0);
+  plannedLists = planAssignments(requests, (i) => candidatesForRow(i), best, LOSS_BUDGET);
+  const counts = new Map<string, number>();
+  let loss = 0;
+  for (let i = 0; i < plannedLists.length; i++) {
+    const first = plannedLists[i][0];
+    if (first === undefined) continue;
+    counts.set(first.provider, (counts.get(first.provider) ?? 0) + 1);
+    loss += requests[i].weight * (best[i] - first.rating);
+  }
+  log(
+    `plan: ${plannedLists.length} requests, planned quality loss ${loss} (budget ${LOSS_BUDGET}), ` +
+      `calls per provider ${[...counts.entries()].map(([p, n]) => `${p} ${n}`).join(', ')}`,
+  );
+}
+
 /** Whether the client's OpenAI body asked for JSON mode. */
 function jsonRequestedOf(body: Json): boolean {
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   return format === 'json_object' || format === 'json_schema';
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+/** The requirements of the request now arriving, with its manifest row: the manifest's row by arrival order, else the body's own. */
+function requirementsFor(body: Json): { requirement: Requirement; index: number } {
   const manifest = brief.workload?.manifest ?? [];
+  const index = manifestIndex;
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
+  if (entry !== undefined) return { requirement: entry.requires, index };
+  return { requirement: requirementsFromBody(body), index };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -373,7 +462,8 @@ async function serve(
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = candidatesFor(requirementsFor(body), jsonRequestedOf(body));
+  const { requirement, index } = requirementsFor(body);
+  const candidates = candidatesForRequest(requirement, jsonRequestedOf(body), index);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   if (!(await serve(candidates, 'openai', body, res))) {
     sendError(res, 'openai', 503, 'no_free_model', 'every free model that meets this request refused');
@@ -384,7 +474,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = candidatesFor(requirementsFor(body), false);
+  const { requirement, index } = requirementsFor(body);
+  const candidates = candidatesForRequest(requirement, false, index);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   if (!(await serve(candidates, 'anthropic', body, res))) {
     sendError(res, 'anthropic', 503, 'overloaded_error', 'every free model that meets this request refused');
@@ -463,6 +554,9 @@ async function start(): Promise<void> {
     process.exit(0);
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
+  // Plan the twenty requests before the first arrives: the plan is a pure
+  // function of the brief, so a live pass and its replay route identically.
+  computePlan();
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
