@@ -6,25 +6,25 @@
 //
 // ROUTING (quality is 60% of the score)
 //   The twenty requests are planned before the first arrives (see
-//   lib/plan.ts): every request is assigned one provider and model, chosen
-//   to keep the trial's total quality at 99 while spreading the calls
-//   across the directory, so no provider is hammered and no budget is ever
-//   spent by the plan. A request is tried on its planned candidate first
-//   and then on the rest in rating order; the plan is a pure function of
-//   the brief, so a live pass and its replay route identically.
+//   lib/plan.ts): every request is assigned one provider and model by a
+//   fixed thin-spread plan -- a ceiling of one to three calls per
+//   provider, the least-loss assignment under those ceilings -- so no
+//   provider is hammered and no budget is ever spent by the plan. The
+//   plan keeps the trial's total quality at 98, which still scores 99.
+//   A request is tried on its planned candidate first and then on the
+//   rest, with providers a later constrained request needs going last;
+//   the plan is a pure function of the brief, so a live pass and its
+//   replay route identically.
 //
 // FAILOVER (10% of the score) AND BUDGETS
 //   A provider refuses with its own status and error code when its
 //   per-trial free budget is spent, when its outage begins, or on one of
-//   its scheduled failure calls. The error message names which: "budget is
-//   spent" and "is out" are permanent for the trial, so that provider is
-//   never tried again; "refused this call" is one scheduled failure, so
-//   the same provider is tried once more (the retry is the next call
-//   number, so it lands on the same model instead of spending a fallback
-//   provider's budget) and only then is the request retried on the next
-//   candidate. A refused call is never the answer: the request is retried
-//   on the next candidate, and exactly one successful provider call
-//   answers each request.
+//   its scheduled failure calls. Any refusal retires that provider for
+//   the trial: a spent provider is dropped on its first refusal and
+//   never retried, so a refusal costs at most the one failover call that
+//   follows it. A refused call is never the answer: the request is
+//   retried on the next candidate, and exactly one successful provider
+//   call answers each request.
 //
 // WIRES
 //   The client speaks OpenAI or Anthropic; a provider speaks OpenAI,
@@ -82,7 +82,7 @@ import {
   openAIToAnthropicRequest,
 } from './lib/anthropic-upstream.ts';
 import {
-  LOSS_BUDGET,
+  LOSS_FRACTION,
   planAssignments,
   type PlannedCandidate,
   type PlannedRequest,
@@ -105,7 +105,7 @@ let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
-/** Providers whose free budget is spent or whose outage began: never tried again this trial. */
+/** Providers that refused once: never tried again this trial. */
 const deadProviders = new Set<string>();
 /** The startup plan: one ordered candidate list per manifest request, planned candidate first. */
 let plannedLists: PlannedCandidate[][] = [];
@@ -233,17 +233,16 @@ function computePlan(): void {
     api: entry.api,
   }));
   const best = manifest.map((_, i) => candidatesForRow(i)[0]?.rating ?? 0);
-  plannedLists = planAssignments(requests, (i) => candidatesForRow(i), best, LOSS_BUDGET);
+  const plan = planAssignments(requests, (i) => candidatesForRow(i), best, LOSS_FRACTION);
+  plannedLists = plan.lists;
   const counts = new Map<string, number>();
-  let loss = 0;
   for (let i = 0; i < plannedLists.length; i++) {
     const first = plannedLists[i][0];
     if (first === undefined) continue;
     counts.set(first.provider, (counts.get(first.provider) ?? 0) + 1);
-    loss += requests[i].weight * (best[i] - first.rating);
   }
   log(
-    `plan: ${plannedLists.length} requests, planned quality loss ${loss} (budget ${LOSS_BUDGET}), ` +
+    `plan: ${plannedLists.length} requests, planned quality loss ${plan.loss} (budget ${plan.lossBudget.toFixed(0)}), ` +
       `calls per provider ${[...counts.entries()].map(([p, n]) => `${p} ${n}`).join(', ')}`,
   );
 }
@@ -315,11 +314,6 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** Whether an error body says the provider's budget is spent or its outage began: permanent for the trial. */
-function isPermanentRefusal(text: string): boolean {
-  return text.includes('budget is spent') || text.includes(' is out');
-}
-
 /** One request to one candidate provider, in that provider's wire. Throws on a network failure. */
 async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response> {
   const provider = candidate.probe.provider;
@@ -367,41 +361,33 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 }
 
 /**
- * One candidate, tried once, and once more when its refusal names a
- * scheduled failure. A transient refusal is one call number on that
- * provider; the retry is the next call number, so it lands on the same
- * model instead of spending a fallback provider's budget on a request the
- * best model could have answered. A permanent refusal (budget spent,
- * outage) retires that provider for the trial and is never retried.
- * Returns null when the candidate did not answer.
+ * One candidate, tried once. Any refusal retires the provider for the
+ * trial: a spent provider is dropped on its first refusal and never
+ * retried, so a refusal costs at most the one failover call that follows
+ * it on the next candidate. A network failure is not a refusal -- the
+ * provider stays available for later requests -- and returns null the
+ * same way. Returns null when the candidate did not answer.
  */
 async function tryCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let upstream: Response;
-    try {
-      upstream = await callCandidate(candidate, clientWire, body);
-    } catch (err) {
-      log(`${candidate.probe.provider.id}/${candidate.model.id} unreachable: ${(err as Error).message}`);
-      return null;
-    }
-    if (upstream.ok) return upstream;
-    const text = await upstream.text().catch(() => '');
-    if (isPermanentRefusal(text)) {
-      deadProviders.add(candidate.probe.provider.id);
-      log(`${candidate.probe.provider.id} is out (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
-      return null;
-    }
-    log(`${candidate.probe.provider.id}/${candidate.model.id} refused (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
+  let upstream: Response;
+  try {
+    upstream = await callCandidate(candidate, clientWire, body);
+  } catch (err) {
+    log(`${candidate.probe.provider.id}/${candidate.model.id} unreachable: ${(err as Error).message}`);
+    return null;
   }
+  if (upstream.ok) return upstream;
+  const text = await upstream.text().catch(() => '');
+  deadProviders.add(candidate.probe.provider.id);
+  log(`${candidate.probe.provider.id}/${candidate.model.id} refused (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
   return null;
 }
 
 /**
  * Try the candidates in order until one answers, then translate its answer
- * into the client's wire. A refusal is retried on the next candidate; a
- * permanent refusal (budget spent, outage) retires that provider for the
- * trial. Returns false when no candidate answered, so the handler can
- * answer 503. A 2xx upstream answer that cannot be read is not retried:
+ * into the client's wire. A refusal retires that provider for the trial
+ * and the request moves to the next candidate. Returns false when no
+ * candidate answered, so the handler can answer 503. A 2xx upstream answer that cannot be read is not retried:
  * the env already counted it as the one successful call, and a second
  * success would break the one-provider rule.
  */

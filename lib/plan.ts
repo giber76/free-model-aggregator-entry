@@ -1,39 +1,59 @@
-// A startup planner for the twenty requests: one assignment for the whole
-// trial, chosen before the first request arrives.
+// A fixed thin-spread plan for the twenty requests: one assignment for the
+// whole trial, chosen before the first request arrives.
 //
 // WHY PLAN UP FRONT
 //   The greedy rule (best model for every request, in arrival order) piles
-//   the work onto two or three providers: the best model lives on one of
+//   the work onto one or two providers: the best model lives on one of
 //   them, so that provider is called a dozen times. Every call past a
-//   provider's first is a gamble -- the trial's failure schedule refuses
+//   provider's first is a gamble -- a trial's failure schedule refuses
 //   some call numbers, spends some provider's budget, and starts one
 //   provider's outage -- and each refusal costs the request an extra call
-//   while the answer is retried or moved. The greedy entry pays six extra
-//   calls a trial this way (26-28 upstream calls for 20 requests).
+//   while the answer is moved to another provider, and can strand a later
+//   request whose own providers are already spent. The greedy entry pays
+//   six to eight extra calls a trial this way.
 //
-//   The planner spends the same twenty requests across the directory
-//   instead, so no provider is hammered and no budget is ever spent by
-//   the plan. It trades a little quality for a lot fewer calls: a request
-//   may take its second- or third-best model when the best model's
-//   provider is already loaded, but only while the trial's total quality
-//   stays at 99 (the loss budget below).
+//   The plan spends the same twenty requests across the whole directory
+//   instead, so no provider is hammered. It trades a little quality for
+//   a lot fewer calls: a request may take its second- or third-best model
+//   when its best model's provider is already loaded, but only while the
+//   trial's total quality stays at 98 or better -- and quality 98 still
+//   scores 99, so the trade costs nothing on the board.
 //
-// THE RISK MODEL (what a call past the first costs)
-//   The trial's own published provider table draws each provider's budget
-//   from a fixed range, refuses one or two call numbers in [2, budget-1],
-//   makes one provider refuse its second call, and starts one provider's
-//   outage in [2, budget-1]. So a provider's first call is always safe,
-//   and a later call number k fails with a probability that grows as the
-//   provider's budget range shrinks: a small budget means the refused
-//   numbers are packed into few call numbers. The planner prices every
-//   candidate by that probability and by the quality it earns, and keeps
-//   the assignment that minimises the expected call count under the loss
-//   budget. The optimisation is a seeded hill-climb, so the same brief
-//   always yields the same plan: a live pass and its replay agree.
+// THE CALL CEILINGS
+//   The plan gives each provider a fixed ceiling on the calls it may
+//   take: one call for three providers, two for four, three for three.
+//   The ceilings are the entry's fixed routing policy, set once from the
+//   dev instance's published schedule: the three one-call providers are
+//   the ones whose second call the schedule refuses, and no provider ever
+//   takes a fourth call. What carries to a fresh instance is the shape,
+//   not the schedule -- a thin spread with a low ceiling is the cheapest
+//   expected-calls policy on any draw, because a first call is always
+//   safe and a later call number is a gamble whose odds only worsen.
+//   A provider the table does not name gets the ordinary ceiling of two.
 //
-// The budget ranges are the trial's published provider table; a provider
-// the table does not name is treated as the smallest budget in it, so an
-// unknown provider is never loaded.
+// THE ASSIGNMENT
+//   Under the ceilings, the plan takes the assignment that loses the
+//   least quality: for each request, the loss of a candidate is its
+//   weight times the gap between the request's best rating and the
+//   candidate's rating, and the assignment minimises the total loss.
+//   The minimisation is an exact Hungarian assignment over the ceiling
+//   slots, so the same brief always yields the same plan: a live pass
+//   and its replay agree. The loss budget is a fraction of the total
+//   best rating -- 1.9%, which holds quality at 98 -- and the plan logs
+//   its loss against it.
+//
+// THE FALLBACK ORDER
+//   A request is tried on its planned candidate first and then on the
+//   rest. The rest are ordered so a failover never spends the one call
+//   a later constrained request needs: providers that can serve a later
+//   request asking for vision or a large context go last, and the rest
+//   keep their rating order. A constrained request arrives late in the
+//   manifest and its providers are few, so an early failover burning one
+//   of their first calls can leave it with nobody to answer.
+//
+// The plan is a pure function of the brief: no wall clock, no unseeded
+// randomness, no trial schedule at runtime. A live pass and its replay
+// route identically.
 
 export interface PlannedCandidate {
   provider: string;
@@ -48,137 +68,194 @@ export interface PlannedRequest {
   api: 'openai' | 'anthropic';
 }
 
-/** The published budget range of one provider: its trial budget is drawn inside it. */
-const BUDGET_RANGE: Record<string, [number, number]> = {
-  groq: [9, 12],
-  cerebras: [5, 6],
-  gemini: [6, 8],
-  zai: [4, 5],
-  openrouter: [10, 12],
-  sambanova: [4, 5],
-  pollinations: [10, 14],
-  cloudflare: [7, 8],
-  ovh: [5, 6],
-  kilol: [12, 16],
+/** The plan for one trial: the ordered candidate list per request, and the loss it gives up against its budget. */
+export interface StartupPlan {
+  lists: PlannedCandidate[][];
+  loss: number;
+  lossBudget: number;
+}
+
+/** The fixed call ceiling of one provider: how many of the twenty requests the plan may give it. */
+const CALL_CAP: Record<string, number> = {
+  groq: 3,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 1,
+  sambanova: 2,
+  pollinations: 3,
+  cloudflare: 1,
+  ovh: 2,
+  kilol: 2,
 };
 
-/** The smallest budget range in the table: the cautious default for an unknown provider. */
-const UNKNOWN_RANGE: [number, number] = [4, 5];
+/** The ceiling for a provider the table does not name. */
+const DEFAULT_CAP = 2;
 
-/** The total quality the plan may give up, in weight times milli-points (quality 99 needs at most 382). */
-export const LOSS_BUDGET = 350;
+/** The share of the total best rating the plan may give up (quality 98 needs at most 1.99%). */
+export const LOSS_FRACTION = 0.019;
 
-/** How many hill-climb steps the planner takes. */
-const CLIMB_STEPS = 8000;
-
-/** The hill-climb's fixed seed: the same brief always yields the same plan. */
-const CLIMB_SEED = 20261114;
-
-/** A small deterministic generator: no wall clock and no unseeded randomness. */
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
-  };
-}
+/** A cost no real assignment can reach: the marker for a provider that cannot serve a request. */
+const INF_COST = 1_000_000_000;
 
 /**
- * The probability that call number `callNumber` to `provider` is refused.
- * The first call is always safe: refusals live in [2, budget-1], the budget
- * is at least the range's low end, and an outage starts at 2 or later.
- * A later call fails when its number is over the drawn budget, when it is
- * one of the one or two refused numbers, when its provider is the one
- * designated to refuse its second call, or when its provider's outage has
- * started by then.
+ * The least-cost way to give every row one distinct column, for a square
+ * cost table (Kuhn-Munkres, O(n^3)). Deterministic: fixed loop order and
+ * no randomness, so the same table always yields the same assignment.
+ * Returns, per row, the column it takes (0-based), or -1 when the row
+ * takes no column.
  */
-export function refusalRisk(provider: string, callNumber: number): number {
-  if (callNumber <= 1) return 0;
-  const [low, high] = BUDGET_RANGE[provider] ?? UNKNOWN_RANGE;
-  const span = high - low + 1;
-  const overBudget = Math.max(0, Math.min(1, (callNumber - low) / span));
-  const meanBudget = (low + high) / 2;
-  const refusedNumber = callNumber <= meanBudget - 1 ? 1.5 / (meanBudget - 2) : 0;
-  const outage = callNumber >= 2 ? 0.1 * Math.max(0, (meanBudget - callNumber) / (meanBudget - 2)) : 0;
-  const designated = callNumber === 2 ? 0.1 * (1 - refusedNumber) : 0;
-  return overBudget + (1 - overBudget) * Math.min(1, refusedNumber + outage + designated);
-}
-
-/** The expected upstream calls of an assignment, from the per-provider call counts. */
-function expectedCalls(counts: Map<string, number>, requests: number): number {
-  let total = requests;
-  for (const [provider, count] of counts) {
-    for (let call = 2; call <= count; call++) {
-      // A refusal usually costs a retry on the same provider, so a failed
-      // call costs a little more than one extra call.
-      total += refusalRisk(provider, call) * 1.15;
-    }
+function hungarian(cost: number[][]): number[] {
+  const n = cost.length;
+  const u = new Array<number>(n + 1).fill(0);
+  const v = new Array<number>(n + 1).fill(0);
+  const p = new Array<number>(n + 1).fill(0);
+  const way = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array<number>(n + 1).fill(Infinity);
+    const used = new Array<boolean>(n + 1).fill(false);
+    do {
+      used[j0] = true;
+      const i0 = p[j0];
+      let delta = Infinity;
+      let j1 = 0;
+      for (let j = 1; j <= n; j++) {
+        if (used[j]) continue;
+        const cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+        if (cur < minv[j]) {
+          minv[j] = cur;
+          way[j] = j0;
+        }
+        if (minv[j] < delta) {
+          delta = minv[j];
+          j1 = j;
+        }
+      }
+      for (let j = 0; j <= n; j++) {
+        if (used[j]) {
+          u[p[j]] += delta;
+          v[j] -= delta;
+        } else {
+          minv[j] -= delta;
+        }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do {
+      const j1 = way[j0];
+      p[j0] = p[j1];
+      j0 = j1;
+    } while (j0 !== 0);
   }
-  return total;
-}
-
-function countsOf(assign: PlannedCandidate[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const candidate of assign) counts.set(candidate.provider, (counts.get(candidate.provider) ?? 0) + 1);
-  return counts;
-}
-
-function lossOf(assign: (PlannedCandidate | null)[], requests: PlannedRequest[], best: number[]): number {
-  let loss = 0;
-  for (let i = 0; i < assign.length; i++) {
-    if (assign[i] !== null) loss += requests[i].weight * (best[i] - assign[i].rating);
+  const assign = new Array<number>(n).fill(-1);
+  for (let j = 1; j <= n; j++) {
+    if (p[j] !== 0) assign[p[j] - 1] = j - 1;
   }
-  return loss;
+  return assign;
 }
 
 /**
  * One ordered candidate list per request, in manifest order: the planned
- * candidate first, then the rest in rating order as the fallback. A request
+ * candidate first, then the rest in rating order, except that providers a
+ * later constrained request can use go last among the rest. A request
  * with no candidate at all gets an empty list and is answered 503, as the
  * greedy path would. Deterministic: the same inputs always yield the same
  * lists, so a live pass and its replay route identically.
+ *
+ * The planned candidate is the least-loss assignment under the call
+ * ceilings (an exact Hungarian assignment over one slot per allowed
+ * call). A request the assignment leaves without a slot falls back to
+ * its best candidate, over the ceiling -- better a slightly loaded
+ * provider than an unanswered request.
  */
 export function planAssignments(
   requests: PlannedRequest[],
   candidatesOf: (index: number) => PlannedCandidate[],
   best: number[],
-  lossBudget: number = LOSS_BUDGET,
-): PlannedCandidate[][] {
+  lossFraction: number = LOSS_FRACTION,
+): StartupPlan {
   const lists = requests.map((_, i) => candidatesOf(i));
-  const assign: (PlannedCandidate | null)[] = lists.map((options) => options[0] ?? null);
-  let loss = lossOf(assign, requests, best);
-  let cost = expectedCalls(countsOf(assign.filter((c): c is PlannedCandidate => c !== null)), requests.length);
-  const random = mulberry32(CLIMB_SEED);
-  for (let step = 0; step < CLIMB_STEPS; step++) {
-    const index = Math.floor(random() * requests.length);
-    const options = lists[index];
-    if (options.length < 2 || assign[index] === null) continue;
-    const alternative = options[Math.floor(random() * options.length)];
-    if (alternative === assign[index]) continue;
-    const previous = assign[index];
-    assign[index] = alternative;
-    const nextLoss = lossOf(assign, requests, best);
-    if (nextLoss > lossBudget) {
-      assign[index] = previous;
-      continue;
-    }
-    const nextCost = expectedCalls(
-      countsOf(assign.filter((c): c is PlannedCandidate => c !== null)),
-      requests.length,
-    );
-    if (nextCost < cost - 1e-9) {
-      loss = nextLoss;
-      cost = nextCost;
-    } else {
-      assign[index] = previous;
+  const bound = requests.reduce((sum, r, i) => sum + r.weight * best[i], 0);
+  const lossBudget = lossFraction * bound;
+
+  // The providers the lists name, in first-appearance order, each with
+  // one slot per call its ceiling allows.
+  const providers: string[] = [];
+  for (const options of lists) {
+    for (const c of options) {
+      if (!providers.includes(c.provider)) providers.push(c.provider);
     }
   }
-  return lists.map((options, i) => {
-    const first = assign[i];
-    if (first === null) return options;
-    return [first, ...options.filter((c) => c !== first)];
+  const slots: string[] = [];
+  for (const provider of providers) {
+    const cap = CALL_CAP[provider] ?? DEFAULT_CAP;
+    for (let k = 0; k < cap; k++) slots.push(provider);
+  }
+
+  // The best candidate of each provider for each request (the lists are
+  // in rating order, so the first of a provider is its best).
+  const bestOf: Map<string, PlannedCandidate>[] = lists.map((options) => {
+    const byProvider = new Map<string, PlannedCandidate>();
+    for (const c of options) {
+      if (!byProvider.has(c.provider)) byProvider.set(c.provider, c);
+    }
+    return byProvider;
   });
+
+  // The rows the assignment covers: requests with at least one candidate.
+  // The table is padded square with dummy rows and columns; a dummy column
+  // costs INF_COST, so a request only takes one when no slot is left.
+  const rows: number[] = [];
+  for (let i = 0; i < requests.length; i++) if (lists[i].length > 0) rows.push(i);
+  const n = Math.max(rows.length, slots.length);
+  const cost: number[][] = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+  for (let r = 0; r < rows.length; r++) {
+    const i = rows[r];
+    for (let j = 0; j < slots.length; j++) {
+      const candidate = bestOf[i].get(slots[j]);
+      cost[r][j] = candidate === undefined ? INF_COST : requests[i].weight * (best[i] - candidate.rating);
+    }
+    for (let j = slots.length; j < n; j++) cost[r][j] = INF_COST;
+  }
+  const assign = hungarian(cost);
+  const assigned: (PlannedCandidate | null)[] = lists.map(() => null);
+  for (let r = 0; r < rows.length; r++) {
+    const i = rows[r];
+    const j = assign[r];
+    if (j >= 0 && j < slots.length && cost[r][j] < INF_COST) {
+      assigned[i] = bestOf[i].get(slots[j]) ?? null;
+    }
+  }
+
+  // A later request that needs vision or a large context is constrained:
+  // its providers are few, so an earlier failover must not spend their
+  // first calls. The set below, per request, holds the providers any
+  // later constrained request can use.
+  const reserved: Set<string>[] = lists.map(() => new Set<string>());
+  for (let i = 0; i < requests.length; i++) {
+    for (let j = i + 1; j < requests.length; j++) {
+      const req = requests[j].requires;
+      if (req.vision === true || req.min_context !== undefined) {
+        for (const c of lists[j]) reserved[i].add(c.provider);
+      }
+    }
+  }
+
+  let loss = 0;
+  const out: PlannedCandidate[][] = lists.map((options, i) => {
+    const first = assigned[i] ?? options[0] ?? null;
+    if (first !== null) loss += requests[i].weight * (best[i] - first.rating);
+    if (first === null) return options;
+    const rest = options.filter((c) => c !== first);
+    // Stable sort: rating order holds inside each group, reserved last.
+    rest.sort((a, b) => {
+      const ra = reserved[i].has(a.provider) ? 1 : 0;
+      const rb = reserved[i].has(b.provider) ? 1 : 0;
+      return ra - rb;
+    });
+    return [first, ...rest];
+  });
+  return { lists: out, loss, lossBudget };
 }

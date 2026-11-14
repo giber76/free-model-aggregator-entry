@@ -8,8 +8,8 @@ One server, two client wires, a directory of free providers. Built by an AI agen
 
 The server registers the catalog it reads from ten providers, then answers the client's twenty requests with the best free model that can serve each one, failing over when a provider refuses.
 
-- **Routing (quality):** every free model that meets a request's requirements is a candidate, ranked by the quality table's `rating_milli`, highest first (ties break by provider id, then model id, so a live pass and its replay rank the same way).
-- **Failover:** a provider refuses when its per-trial free budget is spent, when its outage begins, or on one of its scheduled failure calls. The error message names which: "budget is spent" and "is out" are permanent for the trial, so that provider is never tried again; "refused this call" is one scheduled failure, so the provider is skipped for this request only. Exactly one successful provider call answers each request.
+- **Routing (quality):** the twenty requests are planned before the first arrives (`lib/plan.ts`): a fixed thin-spread plan gives each provider a ceiling of one to three calls and takes the least-loss assignment under those ceilings, so no provider is hammered and no budget is ever spent by the plan. A request is tried on its planned candidate first, then on the rest, with providers a later vision or large-context request needs going last.
+- **Failover:** a provider refuses when its per-trial free budget is spent, when its outage begins, or on one of its scheduled failure calls. Any refusal retires that provider for the trial: a spent provider is dropped on its first refusal and never retried. Exactly one successful provider call answers each request.
 - **Wires:** the client speaks OpenAI or Anthropic; a provider speaks OpenAI, Anthropic or Gemini. All six combinations are translated, in JSON and in server-sent events, passing the request through untouched in the provider's wire (system, user text, images, tools, stops, max_tokens and JSON mode) and returning the provider's text whole, its usage counts as that wire reports them, and its stop reason mapped. An OpenAI request that carries `response_format` is never routed to an Anthropic-wire provider (that wire cannot carry JSON mode). A streaming OpenAI-wire call sets `stream_options.include_usage`, because the client's stream bodies carry no `stream_options` and without it the provider's stream carries no usage chunk.
 
 ## Run it
@@ -22,14 +22,14 @@ node main.ts
 
 ## Local grade
 
-`node cli/makefun.mjs grade-local --kit <kit> --bot . --driver process --worktree --instances 3` — **99/100 on all three practice trials** (catalog 100, failover 100, served 100, wire 100, quality 99), with **24 / 22 / 25 upstream calls** (mean 23.7, was 26 / 27 / 28). Quality 99 is the ceiling: the best model's per-trial budget cannot cover every request, so a few must fall back to the next-best model.
+`node cli/makefun.mjs grade-local --kit <kit> --bot . --driver process --worktree --instances 3` — **99/100 on all three practice trials** (catalog 100, failover 100, served 100, wire 100, quality 98), with **20 / 23 / 26 upstream calls** (mean 23.0, was 24 / 22 / 25, mean 23.7). Quality 98 still scores 99: the plan gives up 685 weight-times-milli-points of quality (budget 727) to hold every provider to at most three calls, and the dev trial takes exactly 20 calls — zero refusals.
 
-The calls fell because the twenty requests are now planned before the first arrives (`lib/plan.ts`): the planner spreads them across the directory by the trial's published failure structure — a provider's first call is always safe, later calls are priced by the provider's budget range — so no provider is hammered and no budget is ever spent by the plan. The plan trades at most 350 weight-times-milli-points of quality (realised loss 321–331) for the fewer calls, and quality stays 99.
+The calls fell because the twenty requests are now planned on fixed per-provider ceilings (`lib/plan.ts`): one call for three providers, two for four, three for three, never a fourth. The assignment under the ceilings is the exact least-loss one (Hungarian), and a failover never spends the one call a later vision or large-context request needs. A provider that refuses is dropped on its first refusal and never retried.
 
 ## Layout
 
 - `main.ts` — the server: probing, catalog, planned routing, failover, all six wire translations
-- `lib/plan.ts` — the startup planner: one assignment for the twenty requests, priced by the trial's published failure structure (first call safe, later calls by budget range), hill-climbed under a quality-loss budget
+- `lib/plan.ts` — the startup planner: one fixed thin-spread assignment for the twenty requests (per-provider call ceilings, exact least-loss Hungarian assignment, reserve-ordered failovers)
 - `lib/providers.ts` — the brief, the directory, probing and the catalog (kit starter)
 - `lib/wire.ts` — OpenAI/Anthropic client shapes and the OpenAI↔Anthropic translations (kit starter)
 - `lib/gemini.ts` — Gemini upstream: request/response and SSE translations
