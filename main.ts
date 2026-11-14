@@ -16,11 +16,13 @@
 //   per-trial free budget is spent, when its outage begins, or on one of
 //   its scheduled failure calls. The error message names which: "budget is
 //   spent" and "is out" are permanent for the trial, so that provider is
-//   never tried again; "refused this call" is one scheduled failure, so the
-//   provider is skipped for this request only and stays in the ranking.
-//   A refused call is never the answer: the request is retried on the next
-//   candidate, and exactly one successful provider call answers each
-//   request.
+//   never tried again; "refused this call" is one scheduled failure, so
+//   the same provider is tried once more (the retry is the next call
+//   number, so it lands on the same model instead of spending a fallback
+//   provider's budget) and only then is the request retried on the next
+//   candidate. A refused call is never the answer: the request is retried
+//   on the next candidate, and exactly one successful provider call
+//   answers each request.
 //
 // WIRES
 //   The client speaks OpenAI or Anthropic; a provider speaks OpenAI,
@@ -276,6 +278,36 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 }
 
 /**
+ * One candidate, tried once, and once more when its refusal names a
+ * scheduled failure. A transient refusal is one call number on that
+ * provider; the retry is the next call number, so it lands on the same
+ * model instead of spending a fallback provider's budget on a request the
+ * best model could have answered. A permanent refusal (budget spent,
+ * outage) retires that provider for the trial and is never retried.
+ * Returns null when the candidate did not answer.
+ */
+async function tryCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let upstream: Response;
+    try {
+      upstream = await callCandidate(candidate, clientWire, body);
+    } catch (err) {
+      log(`${candidate.probe.provider.id}/${candidate.model.id} unreachable: ${(err as Error).message}`);
+      return null;
+    }
+    if (upstream.ok) return upstream;
+    const text = await upstream.text().catch(() => '');
+    if (isPermanentRefusal(text)) {
+      deadProviders.add(candidate.probe.provider.id);
+      log(`${candidate.probe.provider.id} is out (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
+      return null;
+    }
+    log(`${candidate.probe.provider.id}/${candidate.model.id} refused (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
+  }
+  return null;
+}
+
+/**
  * Try the candidates in order until one answers, then translate its answer
  * into the client's wire. A refusal is retried on the next candidate; a
  * permanent refusal (budget spent, outage) retires that provider for the
@@ -293,23 +325,8 @@ async function serve(
   const stream = body.stream === true;
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0]?.model.id ?? 'auto';
   for (const candidate of candidates) {
-    let upstream: Response;
-    try {
-      upstream = await callCandidate(candidate, clientWire, body);
-    } catch (err) {
-      log(`${candidate.probe.provider.id}/${candidate.model.id} unreachable: ${(err as Error).message}`);
-      continue;
-    }
-    if (!upstream.ok) {
-      const text = await upstream.text().catch(() => '');
-      if (isPermanentRefusal(text)) {
-        deadProviders.add(candidate.probe.provider.id);
-        log(`${candidate.probe.provider.id} is out (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
-      } else {
-        log(`${candidate.probe.provider.id}/${candidate.model.id} refused (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
-      }
-      continue;
-    }
+    const upstream = await tryCandidate(candidate, clientWire, body);
+    if (upstream === null) continue;
     const providerWire = candidate.probe.provider.wire;
     const modelId = candidate.model.id;
     try {
