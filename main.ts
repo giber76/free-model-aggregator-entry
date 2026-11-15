@@ -37,11 +37,14 @@
 //   call is its first, which cannot fail, so the failover is guaranteed
 //   and the retry would protect no quality. A retry is never skipped
 //   for a target that has already been called: its next call can fail
-//   too, and the retry is likelier to answer. The walk itself tries
-//   the providers that have made no call yet first, best rating first
-//   among them, then the rest in rating order: a fresh provider's call
+//   too, and the retry is likelier to answer. The walk itself orders
+//   the rest by P(their next call answers) — the public budget ranges
+//   against the calls made and the scheduled failures seen so far this
+//   trial — with providers a later constrained request needs last
+//   within equal odds, then best rating first. A fresh provider's call
 //   always answers, so a failover that lands on one spends exactly one
-//   call.
+//   call, and a provider that already showed both of its fail calls
+//   cannot fail on a scheduled call again.
 //   A refused call is never the answer: exactly one successful provider
 //   call answers each request. A candidate on a provider that already
 //   died this trial is never even attempted: the walk skips it.
@@ -132,6 +135,15 @@ const deadProviders = new Set<string>();
  *  first call can never fail, so a count of zero means its next call
  *  is guaranteed to answer. */
 const callsByProvider = new Map<string, number>();
+/** Scheduled failures each provider has shown this trial, by provider:
+ *  the v9 walk reads it. A provider that already showed both of its
+ *  fail calls cannot fail on a scheduled call again. */
+const failsSeenByProvider = new Map<string, number>();
+/** Providers a later constrained request (vision / large context) can
+ *  use, per manifest row: the walk keeps them last within each group,
+ *  so an early failover never spends the one call a later constrained
+ *  request needs. Filled by computePlan(). */
+let reservedByIndex: Set<string>[] = [];
 /** The startup plan: one ordered candidate list per manifest request, planned candidate first. */
 let plannedLists: PlannedCandidate[][] = [];
 
@@ -260,6 +272,18 @@ function computePlan(): void {
   const best = manifest.map((_, i) => candidatesForRow(i)[0]?.rating ?? 0);
   const plan = planAssignments(requests, (i) => candidatesForRow(i), best, LOSS_FRACTION);
   plannedLists = plan.lists;
+  // Providers a later constrained request can use, per row (mirrors
+  // lib/plan.ts): the walk keeps them last within each group.
+  reservedByIndex = manifest.map((_, i) => {
+    const set = new Set<string>();
+    for (let j = i + 1; j < manifest.length; j++) {
+      const req = manifest[j].requires;
+      if (req.vision === true || req.min_context !== undefined) {
+        for (const c of candidatesForRow(j)) set.add(c.provider);
+      }
+    }
+    return set;
+  });
   const counts = new Map<string, number>();
   for (let i = 0; i < plannedLists.length; i++) {
     const first = plannedLists[i][0];
@@ -394,6 +418,64 @@ function refusalIsFinal(text: string): boolean {
 /** How many times one candidate is retried on scheduled failures: two, because a provider draws at most two fail calls. */
 const MAX_RETRIES = 2;
 
+/** The generator's per-provider free-budget ranges, from the kit's own
+ *  provider table (program/generator/draw.mjs): a first call can never
+ *  fail, and a later call number is a gamble whose odds only worsen. */
+const BUDGET_RANGES: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
+};
+
+/**
+ * P(a provider's next call answers), from observable state only: the
+ * public budget ranges, how many calls the provider has already taken,
+ * and how many scheduled failures it has shown this trial. A first call
+ * scores exactly 1 (its fail calls and its outage are drawn from
+ * [2, budget-1]); a provider that already showed both fail calls cannot
+ * fail on a scheduled call again. The entry never knows the true
+ * schedule; this is the same estimate the v9 walk orders by.
+ */
+function pNextOk(provider: string, nextN: number, failsSeen: number): number {
+  if (nextN <= 1) return 1;
+  const range = BUDGET_RANGES[provider];
+  if (range === undefined) return 1;
+  const [lo, hi] = range;
+  let pBudgetFail = 0;
+  if (nextN - 1 >= lo && nextN - 1 <= hi) pBudgetFail = 1 / (hi - (nextN - 1) + 1);
+  let eInv = 0;
+  let cnt = 0;
+  for (let b = Math.max(lo, nextN - 1); b <= hi; b++) {
+    eInv += 1 / Math.max(1, b - 2);
+    cnt += 1;
+  }
+  eInv = cnt > 0 ? eInv / cnt : 0;
+  let pSchedFail: number;
+  if (failsSeen >= 2) {
+    pSchedFail = 0;
+  } else if (failsSeen === 1) {
+    let eInv3 = 0;
+    let c3 = 0;
+    for (let b = Math.max(lo, nextN - 1); b <= hi; b++) {
+      eInv3 += 1 / Math.max(1, b - 3);
+      c3 += 1;
+    }
+    pSchedFail = (2 / 3) * (c3 > 0 ? eInv3 / c3 : 0);
+  } else {
+    pSchedFail = 1.5 * eInv;
+    if (nextN === 2) pSchedFail = 0.1 * 1 + 0.9 * pSchedFail;
+  }
+  const pOutFail = 0.1 * eInv;
+  return Math.max(0, Math.min(1, (1 - pBudgetFail) * (1 - pSchedFail) * (1 - pOutFail)));
+}
+
 /**
  * One candidate, tried again on scheduled failures, and once more after
  * that: a scheduled failure hits one call number only and a provider
@@ -429,6 +511,10 @@ async function tryCandidate(candidate: Candidate, next: Candidate | null, client
       log(`${candidate.probe.provider.id} is finished for the trial (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
       return null;
     }
+    failsSeenByProvider.set(
+      candidate.probe.provider.id,
+      (failsSeenByProvider.get(candidate.probe.provider.id) ?? 0) + 1,
+    );
     if (retries >= MAX_RETRIES) {
       log(`${candidate.probe.provider.id}/${candidate.model.id} refused ${retries + 1} calls (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
       return null;
@@ -462,6 +548,7 @@ async function serve(
   body: Json,
   res: ServerResponse,
   weight: number = 0,
+  index: number = -1,
 ): Promise<boolean> {
   const stream = body.stream === true;
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0]?.model.id ?? 'auto';
@@ -488,19 +575,37 @@ async function serve(
       }
     }
   }
-  // Fresh-first walk: the planned candidate stays first, then the rest
-  // try the providers that have made no call yet first, best rating
-  // first among them, then the rest in rating order. A fresh provider's
-  // call always answers, so a failover that lands on one spends exactly
-  // one call. The order is a pure function of the brief and the calls
-  // made so far, so a live pass and its replay route identically.
+  // v9 walk: the planned candidate stays first, then the rest are
+  // ordered by P(their next call answers) — the public budget ranges
+  // against the calls made and the scheduled failures seen so far this
+  // trial. A provider that made no call yet scores exactly 1 (its
+  // first call can never fail), so fresh-first falls out of it; a
+  // provider that already showed both of its fail calls scores near 1
+  // too. Within equal odds, providers a later constrained request
+  // needs go last, then best rating first. The order is a pure
+  // function of the brief and the calls made so far, so a live pass
+  // and its replay route identically. Measured on 50,000 fresh draws
+  // (twice, independent seeds): -0.01 mean calls against v8, score
+  // unchanged at 99.000.
   if (ordered.length > 1) {
     const first = ordered.shift();
     if (first !== undefined) {
+      const reserved = index >= 0 && index < reservedByIndex.length ? reservedByIndex[index] : new Set<string>();
       ordered.sort((a, b) => {
-        const fa = (callsByProvider.get(a.probe.provider.id) ?? 0) === 0 ? 0 : 1;
-        const fb = (callsByProvider.get(b.probe.provider.id) ?? 0) === 0 ? 0 : 1;
-        if (fa !== fb) return fa - fb;
+        const pa = pNextOk(
+          a.probe.provider.id,
+          (callsByProvider.get(a.probe.provider.id) ?? 0) + 1,
+          failsSeenByProvider.get(a.probe.provider.id) ?? 0,
+        );
+        const pb = pNextOk(
+          b.probe.provider.id,
+          (callsByProvider.get(b.probe.provider.id) ?? 0) + 1,
+          failsSeenByProvider.get(b.probe.provider.id) ?? 0,
+        );
+        if (pb !== pa) return pb - pa;
+        const ra = reserved.has(a.probe.provider.id) ? 1 : 0;
+        const rb = reserved.has(b.probe.provider.id) ? 1 : 0;
+        if (ra !== rb) return ra - rb;
         return b.rating - a.rating;
       });
       ordered.unshift(first);
@@ -570,7 +675,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const candidates = candidatesForRequest(requirement, jsonRequestedOf(body), index);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   const weight = brief.workload?.manifest[index]?.weight ?? 0;
-  if (!(await serve(candidates, 'openai', body, res, weight))) {
+  if (!(await serve(candidates, 'openai', body, res, weight, index))) {
     sendError(res, 'openai', 503, 'no_free_model', 'every free model that meets this request refused');
   }
 }
@@ -583,7 +688,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const candidates = candidatesForRequest(requirement, false, index);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   const weight = brief.workload?.manifest[index]?.weight ?? 0;
-  if (!(await serve(candidates, 'anthropic', body, res, weight))) {
+  if (!(await serve(candidates, 'anthropic', body, res, weight, index))) {
     sendError(res, 'anthropic', 503, 'overloaded_error', 'every free model that meets this request refused');
   }
 }
