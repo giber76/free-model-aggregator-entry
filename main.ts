@@ -30,10 +30,17 @@
 //   candidate. A provider that refuses on scheduled failures is NOT
 //   retired: its later call numbers can still answer, which is what
 //   keeps every request served on a fresh draw. One exception to the
-//   retry: when the next candidate on another provider answers at the
-//   same rating or better, the request fails over to it at once instead
-//   -- the retry would protect no quality, and the plan often puts a
-//   better-rated model second, having spent the best one on the spread.
+//   retry: when the next candidate on another provider has made no call
+//   yet this trial and answers at the same rating or better, the
+//   request fails over to it at once instead -- that provider's next
+//   call is its first, which cannot fail, so the failover is guaranteed
+//   and the retry would protect no quality. A retry is never skipped
+//   for a target that has already been called: its next call can fail
+//   too, and the retry is likelier to answer. The walk itself tries
+//   the providers that have made no call yet first, best rating first
+//   among them, then the rest in rating order: a fresh provider's call
+//   always answers, so a failover that lands on one spends exactly one
+//   call.
 //   A refused call is never the answer: exactly one successful provider
 //   call answers each request. A candidate on a provider that already
 //   died this trial is never even attempted: the walk skips it.
@@ -119,6 +126,11 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Providers that refused once: never tried again this trial. */
 const deadProviders = new Set<string>();
+/** How many provider calls each provider has taken this trial: the
+ *  fresh-first walk and the fresh-target skip read it. A provider's
+ *  first call can never fail, so a count of zero means its next call
+ *  is guaranteed to answer. */
+const callsByProvider = new Map<string, number>();
 /** The startup plan: one ordered candidate list per manifest request, planned candidate first. */
 let plannedLists: PlannedCandidate[][] = [];
 
@@ -329,6 +341,7 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 /** One request to one candidate provider, in that provider's wire. Throws on a network failure. */
 async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response> {
   const provider = candidate.probe.provider;
+  callsByProvider.set(provider.id, (callsByProvider.get(provider.id) ?? 0) + 1);
   const base = joinBase(ENV_URL, provider.base);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -386,10 +399,13 @@ const MAX_RETRIES = 2;
  * draws at most two, so after two of them the next call cannot be a
  * scheduled failure. A final refusal (budget spent, outage begun)
  * retires the provider at once and is never retried. `next` is the
- * next candidate on another provider still alive: when it answers at
- * the same rating or better, the request fails over to it at once
- * instead of spending the retry, which would protect no quality. A provider
- * that refuses on scheduled failures is NOT retired: its later call
+ * next candidate on another provider still alive: when that provider
+ * has made no call yet this trial and its model answers at the same
+ * rating or better, the request fails over to it at once instead of
+ * spending the retry -- its next call is its first, which cannot fail,
+ * so the failover is guaranteed and the retry would protect no
+ * quality. A retry is never skipped for a target that has already
+ * been called. A provider that refuses on scheduled failures is NOT retired: its later call
  * numbers can still answer, so it stays available for later requests.
  * A network failure is not a refusal -- the provider stays available
  * -- and returns null the same way. Returns null when the candidate
@@ -416,8 +432,12 @@ async function tryCandidate(candidate: Candidate, next: Candidate | null, client
       log(`${candidate.probe.provider.id}/${candidate.model.id} refused ${retries + 1} calls (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
       return null;
     }
-    if (next !== null && next.rating >= candidate.rating) {
-      log(`${candidate.probe.provider.id}/${candidate.model.id} refused one call (HTTP ${upstream.status}); ${next.probe.provider.id}/${next.model.id} answers at the same rating or better, failing over at once`);
+    if (
+      next !== null &&
+      (callsByProvider.get(next.probe.provider.id) ?? 0) === 0 &&
+      next.rating >= candidate.rating
+    ) {
+      log(`${candidate.probe.provider.id}/${candidate.model.id} refused one call (HTTP ${upstream.status}); ${next.probe.provider.id}/${next.model.id} answers at the same rating or better on a provider that has made no call yet, failing over at once`);
       return null;
     }
     retries += 1;
@@ -443,13 +463,34 @@ async function serve(
 ): Promise<boolean> {
   const stream = body.stream === true;
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0]?.model.id ?? 'auto';
-  for (let i = 0; i < candidates.length; i++) {
-    const candidate = candidates[i];
+  // Fresh-first walk: the planned candidate stays first, then the rest
+  // try the providers that have made no call yet first, best rating
+  // first among them, then the rest in rating order. A fresh provider's
+  // call always answers, so a failover that lands on one spends exactly
+  // one call. The order is a pure function of the brief and the calls
+  // made so far, so a live pass and its replay route identically.
+  const ordered = [...candidates];
+  if (ordered.length > 1) {
+    const first = ordered.shift();
+    if (first !== undefined) {
+      ordered.sort((a, b) => {
+        const fa = (callsByProvider.get(a.probe.provider.id) ?? 0) === 0 ? 0 : 1;
+        const fb = (callsByProvider.get(b.probe.provider.id) ?? 0) === 0 ? 0 : 1;
+        if (fa !== fb) return fa - fb;
+        return b.rating - a.rating;
+      });
+      ordered.unshift(first);
+    }
+  }
+  for (let i = 0; i < ordered.length; i++) {
+    const candidate = ordered[i];
+    if (candidate === undefined) continue;
     if (deadProviders.has(candidate.probe.provider.id)) continue;
     let next: Candidate | null = null;
-    for (let j = i + 1; j < candidates.length; j++) {
-      if (candidates[j].probe.provider.id !== candidate.probe.provider.id && !deadProviders.has(candidates[j].probe.provider.id)) {
-        next = candidates[j];
+    for (let j = i + 1; j < ordered.length; j++) {
+      const later = ordered[j];
+      if (later !== undefined && later.probe.provider.id !== candidate.probe.provider.id && !deadProviders.has(later.probe.provider.id)) {
+        next = later;
         break;
       }
     }

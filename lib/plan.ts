@@ -19,24 +19,25 @@
 //   trial's total quality stays at 98 or better -- and quality 98 still
 //   scores 99, so the trade costs nothing on the board.
 //
-// THE CALL CEILINGS
+// THE CALL CEILINGS (v6: re-optimised jointly with the serve policy)
 //   The plan gives each provider a fixed ceiling on the calls it may
-//   take: one call for one provider, two for eight, three for one.
-//   The ceilings are the entry's fixed routing policy, set from the
-//   fresh-draw distribution (Monte Carlo over the kit generator's own
-//   draws), not from the dev instance's published schedule: a first
+//   take. The ceilings are the entry's fixed routing policy, set from
+//   the fresh-draw distribution (Monte Carlo over the kit generator's
+//   own draws), not from the dev instance's published schedule: a first
 //   call is always safe and a later call number is a gamble whose odds
 //   only worsen, so the ceilings put the gambles where they are
-//   cheapest. Kilol alone takes three calls: its budget is the largest
-//   (12-16), so its third call is the safest third call there is. Zai
-//   alone takes one: its budget is the smallest (4-5), so its second
-//   call fails on about three in five fresh draws. OpenRouter and
-//   Cloudflare take two: the dev schedule refuses their second calls,
-//   but on a fresh draw each answers about seven times in ten. No
-//   provider ever takes a fourth call. What carries to a fresh instance
-//   is the shape, not the schedule -- a thin spread with a low ceiling
-//   is the cheapest expected-calls policy on any draw. A provider the
-//   table does not name gets the ordinary ceiling of two.
+//   cheapest. A provider's second call fails about as often as its
+//   third -- the scheduled failures are uniform over the call numbers
+//   -- so what matters is how many non-first calls a provider takes
+//   and how likely each is to fail: sambanova, cerebras and ovh take
+//   one call only (their second call fails about one time in two, two
+//   in three for sambanova); openrouter and kilol take four (their
+//   budgets are the largest, 10-16, so their later calls fail about
+//   one time in seven); groq and cloudflare take three; gemini and
+//   pollinations take one. The least-loss assignment under these
+//   ceilings loses less quality than v5's (583 against 611) AND fails
+//   fewer planned calls, so the trial makes about two fewer calls.
+//   A provider the table does not name gets the ordinary ceiling of two.
 //
 // THE ASSIGNMENT
 //   Under the ceilings, the plan takes the assignment that loses the
@@ -84,16 +85,16 @@ export interface StartupPlan {
 
 /** The fixed call ceiling of one provider: how many of the twenty requests the plan may give it. */
 const CALL_CAP: Record<string, number> = {
-  groq: 2,
-  cerebras: 2,
-  gemini: 2,
+  groq: 3,
+  cerebras: 1,
+  gemini: 1,
   zai: 1,
-  openrouter: 2,
-  sambanova: 2,
-  pollinations: 2,
-  cloudflare: 2,
-  ovh: 2,
-  kilol: 3,
+  openrouter: 4,
+  sambanova: 1,
+  pollinations: 1,
+  cloudflare: 3,
+  ovh: 1,
+  kilol: 4,
 };
 
 /** The ceiling for a provider the table does not name. */
