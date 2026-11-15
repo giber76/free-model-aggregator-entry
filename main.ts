@@ -21,14 +21,22 @@
 //   per-trial free budget is spent, when its outage begins, or on one of
 //   its scheduled failure calls. The error text says which: a spent
 //   budget or a begun outage ends that provider for the trial, so it is
-//   never tried again; a single scheduled failure is one call number
-//   only, so the same provider is tried once more -- the retry is the
-//   next call number, and it usually answers -- and only after that
-//   second refusal does the request move to the next candidate. A
-//   provider that refuses twice on scheduled failures is NOT retired:
-//   its later call numbers can still answer, which is what keeps every
-//   request served on a fresh draw. A refused call is never the answer:
-//   exactly one successful provider call answers each request.
+//   never tried again; a scheduled failure is one call number only, and
+//   a provider draws at most two of them, so the same provider is tried
+//   again -- the retry is the next call number, and it usually answers.
+//   Two scheduled failures in a row spend both of the provider's fail
+//   calls, so a third call cannot be a scheduled failure: it is tried
+//   too, and only after that does the request move to the next
+//   candidate. A provider that refuses on scheduled failures is NOT
+//   retired: its later call numbers can still answer, which is what
+//   keeps every request served on a fresh draw. One exception to the
+//   retry: when the next candidate on another provider answers at the
+//   same rating or better, the request fails over to it at once instead
+//   -- the retry would protect no quality, and the plan often puts a
+//   better-rated model second, having spent the best one on the spread.
+//   A refused call is never the answer: exactly one successful provider
+//   call answers each request. A candidate on a provider that already
+//   died this trial is never even attempted: the walk skips it.
 //
 // WIRES
 //   The client speaks OpenAI or Anthropic; a provider speaks OpenAI,
@@ -369,20 +377,26 @@ function refusalIsFinal(text: string): boolean {
   return text.includes('budget is spent') || text.includes(' is out');
 }
 
+/** How many times one candidate is retried on scheduled failures: two, because a provider draws at most two fail calls. */
+const MAX_RETRIES = 2;
+
 /**
- * One candidate, tried once, and once more when the refusal is a single
- * scheduled failure. A scheduled failure hits one call number only, so
- * the retry -- the very next call number -- usually answers on the same
- * model instead of spending a fallback provider's budget. A final
- * refusal (budget spent, outage begun) retires the provider at once and
- * is never retried. Two scheduled failures in a row end the attempt
- * without retiring the provider: its later call numbers can still
- * answer, so it stays available for later requests. A network failure
- * is not a refusal -- the provider stays available -- and returns null
- * the same way. Returns null when the candidate did not answer.
+ * One candidate, tried again on scheduled failures, and once more after
+ * that: a scheduled failure hits one call number only and a provider
+ * draws at most two, so after two of them the next call cannot be a
+ * scheduled failure. A final refusal (budget spent, outage begun)
+ * retires the provider at once and is never retried. `next` is the
+ * next candidate on another provider still alive: when it answers at
+ * the same rating or better, the request fails over to it at once
+ * instead of spending the retry, which would protect no quality. A provider
+ * that refuses on scheduled failures is NOT retired: its later call
+ * numbers can still answer, so it stays available for later requests.
+ * A network failure is not a refusal -- the provider stays available
+ * -- and returns null the same way. Returns null when the candidate
+ * did not answer.
  */
-async function tryCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response | null> {
-  let retried = false;
+async function tryCandidate(candidate: Candidate, next: Candidate | null, clientWire: 'openai' | 'anthropic', body: Json): Promise<Response | null> {
+  let retries = 0;
   for (;;) {
     let upstream: Response;
     try {
@@ -398,21 +412,26 @@ async function tryCandidate(candidate: Candidate, clientWire: 'openai' | 'anthro
       log(`${candidate.probe.provider.id} is finished for the trial (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
       return null;
     }
-    if (retried) {
-      log(`${candidate.probe.provider.id}/${candidate.model.id} refused a second call (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
+    if (retries >= MAX_RETRIES) {
+      log(`${candidate.probe.provider.id}/${candidate.model.id} refused ${retries + 1} calls (HTTP ${upstream.status}): ${text.slice(0, 120)}`);
       return null;
     }
-    retried = true;
+    if (next !== null && next.rating >= candidate.rating) {
+      log(`${candidate.probe.provider.id}/${candidate.model.id} refused one call (HTTP ${upstream.status}); ${next.probe.provider.id}/${next.model.id} answers at the same rating or better, failing over at once`);
+      return null;
+    }
+    retries += 1;
     log(`${candidate.probe.provider.id}/${candidate.model.id} refused one call (HTTP ${upstream.status}): ${text.slice(0, 120)}; trying it once more`);
   }
 }
 
 /**
  * Try the candidates in order until one answers, then translate its answer
- * into the client's wire. A candidate that refuses twice, or once
- * finally, gives way to the next candidate; a provider retired for the
- * trial never appears again. Returns false when no candidate answered,
- * so the handler can answer 503. A 2xx upstream answer that cannot be read is not retried:
+ * into the client's wire. A candidate that refuses on scheduled failures
+ * is retried (see tryCandidate) and then gives way to the next candidate;
+ * a provider retired for the trial is skipped outright, never attempted.
+ * Returns false when no candidate answered, so the handler can answer
+ * 503. A 2xx upstream answer that cannot be read is not retried:
  * the env already counted it as the one successful call, and a second
  * success would break the one-provider rule.
  */
@@ -424,8 +443,17 @@ async function serve(
 ): Promise<boolean> {
   const stream = body.stream === true;
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0]?.model.id ?? 'auto';
-  for (const candidate of candidates) {
-    const upstream = await tryCandidate(candidate, clientWire, body);
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (deadProviders.has(candidate.probe.provider.id)) continue;
+    let next: Candidate | null = null;
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (candidates[j].probe.provider.id !== candidate.probe.provider.id && !deadProviders.has(candidates[j].probe.provider.id)) {
+        next = candidates[j];
+        break;
+      }
+    }
+    const upstream = await tryCandidate(candidate, next, clientWire, body);
     if (upstream === null) continue;
     const providerWire = candidate.probe.provider.wire;
     const modelId = candidate.model.id;

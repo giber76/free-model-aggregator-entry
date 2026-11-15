@@ -21,15 +21,22 @@
 //
 // THE CALL CEILINGS
 //   The plan gives each provider a fixed ceiling on the calls it may
-//   take: one call for three providers, two for four, three for three.
-//   The ceilings are the entry's fixed routing policy, set once from the
-//   dev instance's published schedule: the three one-call providers are
-//   the ones whose second call the schedule refuses, and no provider ever
-//   takes a fourth call. What carries to a fresh instance is the shape,
-//   not the schedule -- a thin spread with a low ceiling is the cheapest
-//   expected-calls policy on any draw, because a first call is always
-//   safe and a later call number is a gamble whose odds only worsen.
-//   A provider the table does not name gets the ordinary ceiling of two.
+//   take: one call for one provider, two for eight, three for one.
+//   The ceilings are the entry's fixed routing policy, set from the
+//   fresh-draw distribution (Monte Carlo over the kit generator's own
+//   draws), not from the dev instance's published schedule: a first
+//   call is always safe and a later call number is a gamble whose odds
+//   only worsen, so the ceilings put the gambles where they are
+//   cheapest. Kilol alone takes three calls: its budget is the largest
+//   (12-16), so its third call is the safest third call there is. Zai
+//   alone takes one: its budget is the smallest (4-5), so its second
+//   call fails on about three in five fresh draws. OpenRouter and
+//   Cloudflare take two: the dev schedule refuses their second calls,
+//   but on a fresh draw each answers about seven times in ten. No
+//   provider ever takes a fourth call. What carries to a fresh instance
+//   is the shape, not the schedule -- a thin spread with a low ceiling
+//   is the cheapest expected-calls policy on any draw. A provider the
+//   table does not name gets the ordinary ceiling of two.
 //
 // THE ASSIGNMENT
 //   Under the ceilings, the plan takes the assignment that loses the
@@ -77,16 +84,16 @@ export interface StartupPlan {
 
 /** The fixed call ceiling of one provider: how many of the twenty requests the plan may give it. */
 const CALL_CAP: Record<string, number> = {
-  groq: 3,
+  groq: 2,
   cerebras: 2,
-  gemini: 3,
+  gemini: 2,
   zai: 1,
-  openrouter: 1,
+  openrouter: 2,
   sambanova: 2,
-  pollinations: 3,
-  cloudflare: 1,
+  pollinations: 2,
+  cloudflare: 2,
   ovh: 2,
-  kilol: 2,
+  kilol: 3,
 };
 
 /** The ceiling for a provider the table does not name. */
