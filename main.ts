@@ -7,10 +7,11 @@
 // ROUTING (quality is 60% of the score)
 //   The twenty requests are planned before the first arrives (see
 //   lib/plan.ts): every request is assigned one provider and model by a
-//   fixed thin-spread plan -- a ceiling of one to three calls per
-//   provider, the least-loss assignment under those ceilings -- so no
-//   provider is hammered and no budget is ever spent by the plan. The
-//   plan keeps the trial's total quality at 98, which still scores 99.
+//   fixed thin-spread plan -- per-provider ceilings of one to six calls
+//   (kilol six, openrouter four, the rest one or two), the least-loss
+//   assignment under those ceilings -- so no provider is hammered and no
+//   budget is ever spent by the plan. The plan keeps the trial's total
+//   quality at 98, which still scores 99.
 //   A request is tried on its planned candidate first and then on the
 //   rest, with providers a later constrained request needs going last;
 //   the plan is a pure function of the brief, so a live pass and its
